@@ -1,6 +1,10 @@
 #models / datas
 output_dir/
+_data_dir/
 data_dir/
+data_dir2/
+data_dir3/
+train_cache_dir/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

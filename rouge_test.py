@@ -3,10 +3,10 @@
 import jieba # you can use any other word cutting library
 from rouge import Rouge 
 
-hypothesis = "台湾灯会今晚开幕"
+hypothesis = "世界幸福報告出爐芬蘭連7年拔得頭籌"
 hypothesis = ' '.join(jieba.cut(hypothesis)) 
 
-reference = "台湾灯会今晚正式展开，晚间在国父纪念馆举行开灯仪式"
+reference = "芬蘭連7年列世界最幸福國家阿富汗墊底"
 reference = ' '.join(jieba.cut(reference)) 
 
 rouger = Rouge()

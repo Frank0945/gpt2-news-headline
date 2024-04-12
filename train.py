@@ -8,7 +8,7 @@
     文件说明：
     通过新闻正文生成新闻标题的GPT2模型的训练文件
 """
-
+import time 
 import torch
 import os
 import random
@@ -16,7 +16,7 @@ import numpy as np
 import argparse
 import logging
 from transformers.modeling_gpt2 import GPT2Config
-from model import GPT2LMHeadModel
+from  transformers.modeling_gpt2  import GPT2LMHeadModel
 from transformers import BertTokenizer
 from data_set import GPT2NewsTitleDataSet, collate_func
 from torch.utils.data import DataLoader, RandomSampler, SequentialSampler
@@ -26,7 +26,6 @@ try:
     from torch.utils.tensorboard import SummaryWriter
 except ImportError:
     from tensorboardX import SummaryWriter
-
 
 logging.basicConfig(format='%(asctime)s - %(levelname)s - %(name)s -   %(message)s',
                     datefmt='%m/%d/%Y %H:%M:%S',
@@ -67,26 +66,41 @@ def train(model, device, train_data, test_data, args):
         {'params': [p for n, p in param_optimizer if any(
             nd in n for nd in no_decay)], 'weight_decay': 0.0}
     ]
+
     # 设置优化器
     optimizer = AdamW(optimizer_grouped_parameters,
                       lr=args.learning_rate, eps=args.adam_epsilon)
+
+    tr_loss, logging_loss, min_loss = 0.0, 0.0, 0.0
+    start_epoch = -1
+    global_step = 0
     scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=int(args.warmup_proportion * total_steps),
-                                                num_training_steps=total_steps)
+                                                num_training_steps=total_steps, last_epoch=start_epoch)
+    # 斷點續訓
+    if os.path.exists(args.train_cache_path):
+        checkpoint = torch.load(args.train_cache_path)
+        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        start_epoch = checkpoint['epoch']
+        global_step = checkpoint['global_step']
+        tr_loss = checkpoint['loss']
+        logging_loss = checkpoint['logging_loss']
+        scheduler.load_state_dict(checkpoint['scheduler'])
+        print("\n loading from cache", start_epoch, global_step, tr_loss, logging_loss)
+
     # 清空cuda缓存
     torch.cuda.empty_cache()
     # 将模型调至训练状态
     model.train()
     title_id = train_data.title_id
-    tr_loss, logging_loss, min_loss = 0.0, 0.0, 0.0
-    global_step = 0
+    saved_time = time.time()
     # 开始训练模型
-    for iepoch in trange(0, int(args.num_train_epochs), desc="Epoch", disable=False):
-        iter_bar = tqdm(train_data_loader, desc="Iter (loss=X.XXX)", disable=False)
+    for iepoch in trange(0 if start_epoch == -1 else start_epoch, int(args.num_train_epochs), desc="Epoch", disable=False):
+        iter_bar = tqdm(train_data_loader, desc="Iter (loss=X.XXX)", disable=False, position=0)
         for step, batch in enumerate(iter_bar):
             input_ids = batch["input_ids"].to(device)
             token_type_ids = batch["token_type_ids"].to(device)
             # 获取训练结果
-            outputs = model.forward(input_ids=input_ids, token_type_ids=token_type_ids, labels=input_ids, title_id=title_id)
+            outputs = model.forward(input_ids=input_ids, token_type_ids=token_type_ids, labels=input_ids)
             loss = outputs[0]
             tr_loss += loss.item()
             # 将损失值放到Iter中，方便观察
@@ -105,22 +119,60 @@ def train(model, device, train_data, test_data, args):
                 global_step += 1
                 # 如果步数整除logging_steps，则记录学习率和训练集损失值
                 if args.logging_steps > 0 and global_step % args.logging_steps == 0:
-                    tb_write.add_scalar("lr", scheduler.get_lr()[0], global_step)
-                    tb_write.add_scalar("train_loss", (tr_loss-logging_loss) /
-                                        (args.logging_steps*args.gradient_accumulation_steps), global_step)
+                    try:
+                        tb_write.add_scalar("lr", scheduler.get_last_lr()[0], global_step)
+                        tb_write.add_scalar("train_loss", (tr_loss-logging_loss) /
+                                            (args.logging_steps*args.gradient_accumulation_steps), global_step)
+                    except Exception as e:
+                        print("error: ", e)
                     logging_loss = tr_loss
+
                 # 如果步数整除eval_steps，则进行模型测试，记录测试集的损失
                 if args.eval_steps > 0 and global_step % args.eval_steps == 0:
                     eval_loss = evaluate(model, device, test_data, args)
-                    tb_write.add_scalar("test_loss", eval_loss, global_step)
+                    try:
+                        tb_write.add_scalar("test_loss", eval_loss, global_step)
+                    except Exception as e:
+                        print("error: ", e)
+
                     model.train()
-        # 每个epoch进行完，则保存模型
-        output_dir = os.path.join(args.output_dir, "checkpoint-{}".format(global_step))
+
+            # 每5分钟暫存一次
+            # if time.time() - saved_time > 2 * 60:
+            #     saved_time = time.time()
+            #     torch.cuda.empty_cache()
+            #     torch.save({
+            #         'epoch': iepoch,
+            #         'model_state_dict': model.state_dict(),
+            #         'optimizer_state_dict': optimizer.state_dict(),
+            #         'global_step': global_step,
+            #         'loss': tr_loss,
+            #         'logging_loss': logging_loss,
+            #     }, args.train_cache_path)
+                
+            #     print("\n save cache", iepoch, global_step, tr_loss, logging_loss)
+            #     print("step: ", step)
+
+        # epoch进行完，保存模型
+        output_dir = os.path.join(args.output_dir, "checkpoint")
         model_to_save = model.module if hasattr(model, "module") else model
         model_to_save.save_pretrained(output_dir)
+        print("checkpoint-{}".format(global_step))
         # 清空cuda缓存
         torch.cuda.empty_cache()
-
+        torch.save({
+            'epoch': iepoch + 1,
+            'model_state_dict': model.state_dict(),
+            'optimizer_state_dict': optimizer.state_dict(),
+            'scheduler': scheduler.state_dict(),
+            'global_step': global_step,
+            'loss': tr_loss,
+            'logging_loss': logging_loss,
+        }, args.train_cache_path)
+        
+                
+        print("\n save cache", iepoch, global_step, tr_loss, logging_loss)
+        print("step: ", step)
 
 def evaluate(model, device, test_data, args):
     """
@@ -138,7 +190,7 @@ def evaluate(model, device, test_data, args):
     test_sampler = SequentialSampler(test_data)
     test_data_loader = DataLoader(test_data, sampler=test_sampler,
                                   batch_size=args.test_batch_size, collate_fn=collate_func)
-    iter_bar = tqdm(test_data_loader, desc="iter", disable=False)
+    iter_bar = tqdm(test_data_loader, desc="iter", disable=False, position=0)
     title_id = test_data.title_id
     total_loss, total = 0.0, 0.0
     # 进行测试
@@ -166,23 +218,24 @@ def set_args():
     parser.add_argument('--device', default='0', type=str, help='设置训练或测试时使用的显卡')
     parser.add_argument('--config_path', default='./config/config.json', type=str, help='模型参数配置信息')
     parser.add_argument('--vocab_path', default='./vocab/vocab.txt', type=str, help='词表，该词表为小词表，并增加了一些新的标记')
-    parser.add_argument('--train_file_path', default='./data_dir/train_data.json', type=str, help='新闻标题生成的训练数据')
-    parser.add_argument('--test_file_path', default='./data_dir/test_data.json', type=str, help='新闻标题生成的测试数据')
+    parser.add_argument('--train_file_path', default='./data_dir3/train_data.json', type=str, help='新闻标题生成的训练数据')
+    parser.add_argument('--test_file_path', default='./data_dir3/test_data.json', type=str, help='新闻标题生成的测试数据')
     parser.add_argument('--pretrained_model_path', default=None, type=str, help='预训练的GPT2模型的路径')
-    parser.add_argument('--data_dir', default='./data_dir', type=str, help='生成缓存数据的存放路径')
-    parser.add_argument('--num_train_epochs', default=5, type=int, help='模型训练的轮数')
-    parser.add_argument('--train_batch_size', default=16, type=int, help='训练时每个batch的大小')
+    parser.add_argument('--data_dir', default='./data_dir3', type=str, help='生成缓存数据的存放路径')
+    parser.add_argument('--num_train_epochs', default=10, type=int, help='模型训练的轮数')
+    parser.add_argument('--train_batch_size', default=4, type=int, help='训练时每个batch的大小')
     parser.add_argument('--test_batch_size', default=8, type=int, help='测试时每个batch的大小')
     parser.add_argument('--learning_rate', default=1e-4, type=float, help='模型训练时的学习率')
     parser.add_argument('--warmup_proportion', default=0.1, type=float, help='warm up概率，即训练总步长的百分之多少，进行warm up')
     parser.add_argument('--adam_epsilon', default=1e-8, type=float, help='Adam优化器的epsilon值')
     parser.add_argument('--logging_steps', default=20, type=int, help='保存训练日志的步数')
-    parser.add_argument('--eval_steps', default=4000, type=int, help='训练时，多少步进行一次测试')
+    parser.add_argument('--eval_steps', default=1000, type=int, help='训练时，多少步进行一次测试')
     parser.add_argument('--gradient_accumulation_steps', default=4, type=int, help='梯度积累')
     parser.add_argument('--max_grad_norm', default=1.0, type=float, help='')
     parser.add_argument('--output_dir', default='output_dir/', type=str, help='模型输出路径')
+    parser.add_argument('--train_cache_path', default='./train_cache_dir/cache.pkl', type=str, help='')
     parser.add_argument('--seed', type=int, default=2020, help='随机种子')
-    parser.add_argument('--max_len', type=int, default=512, help='输入模型的最大长度，要比config中n_ctx小')
+    parser.add_argument('--max_len', type=int, default=768, help='输入模型的最大长度，要比config中n_ctx小')
     parser.add_argument('--title_max_len', type=int, default=32, help='生成标题的最大长度，要比max_len小')
     return parser.parse_args()
 
@@ -212,9 +265,8 @@ def main():
         model = GPT2LMHeadModel(config=model_config)
     # model = GPT2LMHeadModel(config=model_config)
     # 实例化tokenizer
-    tokenizer = BertTokenizer.from_pretrained(args.vocab_path, do_lower_case=True)
-    # 将[space]作为一个分割整体，例如："我爱[Space]中国。"，使用原始tokenizer分词结果为"['我', '爱', '[', 'Space', ']', '中', '国', '。']";
-    # 增加分割符号后的结果为"['我', '爱', '[Space]', '中', '国', '。']"
+
+    tokenizer = BertTokenizer(args.vocab_path, do_lower_case=True)
     tokenizer.add_tokens("[Space]", special_tokens=True)
     # 创建模型的输出目录
     if not os.path.exists(args.output_dir):
@@ -223,9 +275,18 @@ def main():
     train_data = GPT2NewsTitleDataSet(tokenizer, args.max_len, args.title_max_len, args.data_dir, "train", args.train_file_path)
     test_data = GPT2NewsTitleDataSet(tokenizer, args.max_len, args.title_max_len, args.data_dir, "test", args.test_file_path)
     # 开始训练
+
+    # 斷點續訓
+    if os.path.exists(args.train_cache_path):
+        checkpoint = torch.load(args.train_cache_path)
+        model.load_state_dict(checkpoint['model_state_dict'])        
+        print("\n loading from cache")
+
+    for param in model.parameters():
+        param.requires_grad = True
+
     train(model, device, train_data, test_data, args)
 
 
 if __name__ == '__main__':
     main()
-
